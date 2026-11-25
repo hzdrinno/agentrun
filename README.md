@@ -4,7 +4,7 @@ Run Python on another PC through a single TCP port. The runner manages uploaded 
 
 ## Run locally
 
-Python 3.11 or newer is required. The runner and its client use only the standard library.
+Python 3.11 or newer is required. The runner and client use only the standard library unless you generate a certificate with `--tls-auto`.
 
 ```text
 python runner.py
@@ -21,7 +21,16 @@ Use `--work-dir` to select the worker's initial working directory and `--worker-
 
 ## Access it through a proxy
 
-Bind to the address your TCP proxy targets and supply a TLS certificate and its private key. A direct non-loopback listener requires TLS.
+Bind to the address your TCP proxy targets. To generate a self-signed certificate on the runner PC, install the optional certificate generation dependency once and start the runner with `--tls-auto`.
+
+```text
+python -m pip install --only-binary=:all: cryptography
+python runner.py --port 12260 --tls-auto
+```
+
+This listens on loopback. For a proxy on another PC, add `--host` with the runner's reachable IP address. The runner creates `runner.pem` and `runner-key.pem` in its state directory and reuses them on future starts. Give clients `runner.pem` for `--ca` and use `--server-name agentrun`. Keep `runner-key.pem` on the runner PC. The generated certificate is valid for a year.
+
+If you already have a TLS certificate and private key, supply the PEM files directly. A direct non-loopback listener requires TLS.
 
 ```text
 python runner.py --port 7700 --host <bind-IP> --cert runner.pem --key runner-key.pem

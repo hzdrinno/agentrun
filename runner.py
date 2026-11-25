@@ -17,6 +17,8 @@ import sys
 import time
 import uuid
 
+from runner_tls import TLS_NAME, ensure_tls_files
+
 MAX_FRAME = 1024 * 1024
 MAX_SOURCE = 256 * 1024
 MAX_EVENT = 64 * 1024
@@ -382,6 +384,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="numeric bind address")
     parser.add_argument("--cert", type=Path, help="PEM certificate chain for remote access")
     parser.add_argument("--key", type=Path, help="PEM private key for remote access")
+    parser.add_argument("--tls-auto", action="store_true", help="create or reuse a TLS certificate in the state directory")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".python-runner")
     parser.add_argument("--read-token-file", type=Path)
     parser.add_argument("--work-dir", type=Path, default=Path.cwd())
@@ -403,17 +406,23 @@ def main():
         if not 1 <= args.buffer_records or args.buffer_bytes < MAX_EVENT * 2:
             raise ValueError("require at least one record and 131072 bytes of buffer")
         address = ipaddress.ip_address(args.host)
+        if args.tls_auto and (args.cert or args.key):
+            raise ValueError("use --tls-auto or supply --cert and --key")
         if bool(args.cert) != bool(args.key):
             raise ValueError("provide both --cert and --key")
-        if not address.is_loopback and args.cert is None:
-            raise ValueError("a non-loopback listener requires --cert and --key")
+        if not address.is_loopback and args.cert is None and not args.tls_auto:
+            raise ValueError("a non-loopback listener requires --tls-auto or --cert and --key")
+        args.state_dir = args.state_dir.resolve()
+        args.state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if args.tls_auto:
+            args.cert, args.key = ensure_tls_files(args.state_dir)
         tls = None
         if args.cert:
             tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             tls.minimum_version = ssl.TLSVersion.TLSv1_2
             tls.load_cert_chain(args.cert, args.key)
-        args.state_dir = args.state_dir.resolve()
-        args.state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if args.tls_auto:
+                LOG.info("public TLS certificate: %s (client --server-name %s)", args.cert, TLS_NAME)
         token_path = args.state_dir / "operator.token"
         token = operator_token(token_path)
         read_token = load_token(args.read_token_file.read_bytes()) if args.read_token_file else None
