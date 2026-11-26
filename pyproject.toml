@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentrun"
+version = "0.2.0"
+description = "Run trusted Python programs with buffered input and output through one TCP port."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+tls = ["cryptography"]
+
+[project.scripts]
+agentrun = "runner:main"
+agentrun-client = "runner_client:main"
+
+[tool.setuptools]
+py-modules = ["runner", "runner_worker", "runner_client", "runner_tls"]

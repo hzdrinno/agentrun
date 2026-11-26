@@ -1,9 +1,22 @@
-"""Create and retain a self-signed server identity for --tls-auto."""
+"""Create and inspect a self-signed server identity for --tls-auto."""
 
 from datetime import datetime, timedelta, timezone
 import os
 
 TLS_NAME = "agentrun"
+
+
+def cert_not_after(cert_path):
+    """Return the certificate's UTC expiry datetime, or None if unavailable."""
+    try:
+        from cryptography import x509
+    except ImportError:
+        return None
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=timezone.utc)
 
 
 def ensure_tls_files(state_dir):
