@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 from runner_client import Client, RemoteError, resolve_connection
 from runner_tls import TLS_NAME, cert_not_after
@@ -426,6 +427,83 @@ class SelfUpdateTests(unittest.TestCase):
                     self.assertTrue(updated["restarting"])
                     self.assertEqual(updated["new_rev"], new_head)
                     self.assertEqual(updated["live"]["rev"], new_head[:12])
+            finally:
+                stop_proc(proc)
+
+
+class PackageInstallTests(unittest.TestCase):
+    @staticmethod
+    def _make_wheel(directory, name, version, module_code):
+        dist = name.replace("-", "_")
+        wheel_path = directory / f"{dist}-{version}-py3-none-any.whl"
+        with zipfile.ZipFile(wheel_path, "w") as zf:
+            zf.writestr(f"{dist}/__init__.py", module_code)
+            zf.writestr(f"{dist}-{version}.dist-info/METADATA",
+                        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+            zf.writestr(f"{dist}-{version}.dist-info/WHEEL",
+                        "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            zf.writestr(f"{dist}-{version}.dist-info/RECORD", "")
+        return wheel_path
+
+    def test_direct_and_relay_install_persist_in_host_python(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            venv_dir = base / "venv"
+            venv_res = subprocess.run([sys.executable, "-m", "venv", str(venv_dir)],
+                                      capture_output=True, text=True)
+            if venv_res.returncode != 0:
+                self.skipTest(f"venv unavailable: {venv_res.stderr}")
+            worker_py = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            if subprocess.run([str(worker_py), "-m", "pip", "--version"],
+                              capture_output=True).returncode != 0:
+                self.skipTest("pip unavailable inside venv")
+            wheelhouse = base / "wheels"
+            wheelhouse.mkdir()
+            self._make_wheel(wheelhouse, "agentrun-direct-demo", "0.1.0", "VALUE = 'direct-ok'\n")
+            self._make_wheel(wheelhouse, "agentrun-relay-demo", "0.2.0", "VALUE = 'relay-ok'\n")
+            state = base / "state"
+            port = free_port()
+            proc = subprocess.Popen(
+                [sys.executable, str(ROOT / "runner.py"), "--port", str(port),
+                 "--state-dir", str(state), "--work-dir", str(base),
+                 "--worker-python", str(worker_py)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                tok = wait_for_runner(proc, port, state / "operator.token")
+                with Client("127.0.0.1", port, tok) as client:
+                    # 1. Direct install (offline via local wheelhouse)
+                    direct = client.install(
+                        ["agentrun-direct-demo"],
+                        pip_args=["--no-index", "--find-links", str(wheelhouse)],
+                    )
+                    self.assertEqual(direct["installed"], ["agentrun-direct-demo"])
+                    self.assertNotIn("relayed", direct)
+
+                    # 2. Relay install: client downloads matching wheel and pushes it to host
+                    relayed = client.install(
+                        ["agentrun-relay-demo"],
+                        relay=True,
+                        pip_args=["--no-index", "--find-links", str(wheelhouse)],
+                    )
+                    self.assertEqual(relayed["relayed"], ["agentrun_relay_demo-0.2.0-py3-none-any.whl"])
+
+                    # 3. Verify both persist across a brand-new AgentRun worker AND standalone Python
+                    check_src = (
+                        "import agentrun_direct_demo, agentrun_relay_demo\n"
+                        "ctx.emit('ok', [agentrun_direct_demo.VALUE, agentrun_relay_demo.VALUE])\n"
+                    )
+                    pid = client.request("upload", source=check_src)["program_id"]
+                    rid = client.request("start", program_id=pid)["run_id"]
+                    records = list(client.iter_records(rid))
+                    self.assertEqual(records[0]["value"], ["direct-ok", "relay-ok"])
+                    standalone = subprocess.run(
+                        [str(worker_py), "-c",
+                         "import agentrun_direct_demo, agentrun_relay_demo; "
+                         "print(agentrun_direct_demo.VALUE, agentrun_relay_demo.VALUE)"],
+                        check=True, capture_output=True, text=True,
+                    )
+                    self.assertEqual(standalone.stdout.strip(), "direct-ok relay-ok")
             finally:
                 stop_proc(proc)
 

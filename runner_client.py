@@ -9,8 +9,11 @@ import os
 from pathlib import Path
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
+import uuid
 
 MAX_FRAME = 1024 * 1024
 IDLE_RECONNECT_S = 50.0
@@ -67,6 +70,56 @@ except BaseException:
     tmp.unlink(missing_ok=True)
     raise
 ctx.emit("done", {"path": str(dest), "size": size, "sha256": digest.hexdigest()})
+"""
+
+_HOST_ENV_SCRIPT = """\
+import sys, sysconfig, tempfile
+impl = {"cpython": "cp", "pypy": "pp"}.get(sys.implementation.name, sys.implementation.name)
+try:
+    from pip._vendor.packaging.tags import sys_tags
+    platforms = [p for p in dict.fromkeys(t.platform for t in sys_tags()) if p != "any"]
+except Exception:
+    platforms = [sysconfig.get_platform().replace("-", "_").replace(".", "_")]
+ctx.emit("env", {
+    "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+    "impl": impl,
+    "platforms": platforms,
+    "temp_root": tempfile.gettempdir(),
+})
+"""
+
+_PIP_INSTALL_SCRIPT = """\
+import shutil, subprocess, sys, sysconfig, tempfile
+
+def site_writable():
+    if sys.prefix != sys.base_prefix:
+        return True
+    try:
+        with tempfile.TemporaryFile(dir=sysconfig.get_path("purelib")):
+            return True
+    except OSError:
+        return False
+
+cfg = ctx.config
+cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input"]
+if not cfg.get("allow_source"):
+    cmd.append("--only-binary=:all:")
+if cfg.get("upgrade"):
+    cmd.append("--upgrade")
+if not site_writable():
+    cmd.append("--user")
+if cfg.get("find_links"):
+    cmd.extend(["--no-index", "--find-links", cfg["find_links"]])
+cmd.extend(cfg.get("pip_args", []))
+cmd.extend(cfg["packages"])
+try:
+    res = subprocess.run(cmd)
+    ctx.emit("done", {"returncode": res.returncode, "python": sys.executable, "command": cmd})
+finally:
+    if cfg.get("cleanup_dir"):
+        shutil.rmtree(cfg["cleanup_dir"], ignore_errors=True)
+if res.returncode != 0:
+    sys.exit(res.returncode)
 """
 
 
@@ -330,6 +383,72 @@ class Client:
             result["live"] = self._wait_after_restart(wait_s, expected_rev=expected_rev)
         return result
 
+    def install(self, packages, *, relay=False, allow_source=False, upgrade=False,
+                timeout_s=300, pip_args=()):
+        if not packages:
+            raise ValueError("specify at least one package to install")
+        if relay and allow_source:
+            raise ValueError("--relay downloads prebuilt wheels for the target host and cannot be combined with --allow-source")
+        packages = list(packages)
+        extra_args = list(pip_args)
+        find_links = None
+        relayed = None
+        if relay:
+            env_prog = self.request("upload", source=_HOST_ENV_SCRIPT)["program_id"]
+            env_run = self.request("start", program_id=env_prog, timeout_s=30)["run_id"]
+            env = None
+            for record in self.iter_records(env_run):
+                if record["channel"] == "env":
+                    env = record["value"]
+            if env is None or self.last_status["returncode"] != 0:
+                raise RemoteError("failed to inspect remote Python environment")
+            with tempfile.TemporaryDirectory() as local_tmp:
+                dl_cmd = [
+                    sys.executable, "-m", "pip", "download",
+                    "--disable-pip-version-check", "--no-input", "--dest", local_tmp,
+                    "--python-version", env["python"], "--implementation", env["impl"],
+                ]
+                if not allow_source:
+                    dl_cmd.append("--only-binary=:all:")
+                for plat in env["platforms"]:
+                    dl_cmd.extend(["--platform", plat])
+                dl_cmd.extend(extra_args)
+                dl_cmd.extend(packages)
+                dl = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=timeout_s)
+                if dl.returncode != 0:
+                    raise RemoteError(f"local pip download failed: {(dl.stderr or dl.stdout).strip()}")
+                files = sorted(Path(local_tmp).iterdir())
+                if not files:
+                    raise RemoteError("pip download produced no files")
+                find_links = f"{env['temp_root'].rstrip('/\\\\')}/agentrun-pip-{uuid.uuid4().hex[:12]}"
+                for wheel in files:
+                    self.push_file(wheel, f"{find_links}/{wheel.name}")
+                relayed = [wheel.name for wheel in files]
+                extra_args = []
+        prog = self.request("upload", source=_PIP_INSTALL_SCRIPT)["program_id"]
+        cfg = {
+            "packages": packages,
+            "allow_source": allow_source,
+            "upgrade": upgrade,
+            "find_links": find_links,
+            "cleanup_dir": find_links,
+            "pip_args": extra_args,
+        }
+        run_id = self.request("start", program_id=prog, config=cfg, timeout_s=timeout_s)["run_id"]
+        done = None
+        for record in self.iter_records(run_id):
+            if record["channel"] == "done":
+                done = record["value"]
+            elif record["channel"] == "log":
+                sys.stderr.write(record["value"])
+                sys.stderr.flush()
+        if done is None or done["returncode"] != 0 or self.last_status["returncode"] != 0:
+            raise RemoteError(f"remote pip install failed (returncode={self.last_status['returncode']})")
+        result = {"installed": packages, "python": done["python"]}
+        if relayed is not None:
+            result["relayed"] = relayed
+        return result
+
 
 def _load_config_arg(args):
     if getattr(args, "config_file", None) is not None:
@@ -394,6 +513,14 @@ def main():
     upd = sub.add_parser("update", help="pull latest runner code from git and restart")
     upd.add_argument("--force", action="store_true")
     upd.add_argument("--no-restart", action="store_true")
+    inst = sub.add_parser("install", help="install Python packages into the host Python")
+    inst.add_argument("packages", nargs="+")
+    inst.add_argument("--relay", action="store_true",
+                      help="download wheels on the client and push them to an offline host")
+    inst.add_argument("--allow-source", action="store_true",
+                      help="allow source distributions instead of --only-binary=:all:")
+    inst.add_argument("--upgrade", "-U", action="store_true")
+    inst.add_argument("--timeout", type=int, default=300)
 
     args = parser.parse_args()
     try:
@@ -491,6 +618,10 @@ def main():
                 result = client.push_file(args.local, args.remote)
             elif args.command == "update":
                 result = client.update(force=args.force, restart=not args.no_restart)
+            elif args.command == "install":
+                result = client.install(args.packages, relay=args.relay,
+                                        allow_source=args.allow_source,
+                                        upgrade=args.upgrade, timeout_s=args.timeout)
             else:
                 result = client.request(args.command, run_id=args.run_id)
             print(json.dumps(result, indent=2))

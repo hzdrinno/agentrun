@@ -86,6 +86,8 @@ python runner_client.py read <run_id> --tail 10 --follow
 python runner_client.py stop <run_id> --grace-s 5
 python runner_client.py pull remote/output.csv local.csv
 python runner_client.py push helper.py helper.py
+python runner_client.py install numpy scipy
+python runner_client.py install --relay numpy
 ```
 
 Upload stores a UTF-8 Python file (retaining the 256 most recently used scripts) and returns its SHA-256 ID. Starting a program returns a unique run ID and passes `config` as `ctx.config` (plus `ctx.run_id`, `ctx.program_id`, and `ctx.stopping`).
@@ -94,6 +96,7 @@ Upload stores a UTF-8 Python file (retaining the 256 most recently used scripts)
 - `ctx.emit(channel, value, timestamp=...)` publishes JSON from any thread. Ordinary stdout and stderr become `log` records. Standard input (`fd 0`) is detached to `devnull`.
 - Stopping a run (via `stop`, `timeout_s`, or runner shutdown) closes the worker's inbox first and waits up to `grace_s` (default 1.5 s) so `EOFError` / `ctx.stopping` / `finally:` cleanup can run before `terminate()`/`kill()`.
 - `pull` and `push` stream arbitrary-size files through the existing protocol with flow control and SHA-256 verification.
+- `install` runs `pip install --only-binary=:all:` directly into the host's Python (falling back to `--user` if global `site-packages` is read-only), so installed packages persist across runs and are shared with other Python apps on the host. Pass `--relay` when the host has no PyPI access to download matching wheels on the client, push them over the TCP link, and install offline.
 
 ## Self-update from Git
 

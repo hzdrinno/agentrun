@@ -482,6 +482,7 @@ class Runner:
             "rev": self.rev,
             "hostname": socket.gethostname(),
             "platform": platform.system(),
+            "machine": platform.machine(),
             "python": platform.python_version(),
             "work_dir": str(self.args.work_dir),
             "active_workers": sum(run.state == "running" for run in self.runs.values()),
